@@ -5,6 +5,7 @@ use std::{
 
 const DATA_SIZE: usize = u8::MAX as usize;
 const TIMEOUT_MS: u64 = 200;
+const TIMEOUT_SEC: u64 = 60;
 
 #[derive(Debug, Clone)]
 enum PacketState {
@@ -50,7 +51,7 @@ impl Sender {
         }
     }
 
-    pub fn send(&mut self, message: String) {
+    pub fn send(&mut self, message: &str) {
         let bytes = message.as_bytes();
         let total_packets = bytes.len().div_ceil(DATA_SIZE).max(2);
         while self.packets_send_ack < total_packets {
@@ -150,6 +151,7 @@ impl Reader {
     pub fn read(&mut self) -> String {
         let mut data = Vec::<u8>::new();
         let timeout = Duration::from_millis(TIMEOUT_MS);
+        let elapsed = Instant::now();
         loop {
             match self.rx.recv_timeout(timeout) {
                 Ok(packet) => {
@@ -216,31 +218,33 @@ mod tests {
         s
     }
 
-    fn setup(window_size: AckNumber, message: String) -> String {
+    fn setup(window_size: AckNumber, message: &str) -> String {
         let (tx_packet, rx_packet) = mpsc::channel();
         let (tx_ack, rx_ack) = mpsc::channel();
         let mut sender = Sender::new(tx_packet, rx_ack, window_size);
         let mut reader = Reader::new(tx_ack, rx_packet);
-        let sender_handle = thread::spawn(move || {
-            sender.send(message);
+        let message_received = thread::scope(|s| {
+            s.spawn(|| {
+                sender.send(message);
+            });
+
+            reader.read()
         });
-        let message_received = reader.read();
-        sender_handle.join().unwrap();
         message_received
     }
 
-    fn setup_loss(window_size: AckNumber, message: String, loss: f64) -> String {
+    fn setup_loss(window_size: AckNumber, message: &str, loss: f64) -> String {
         let (tx_packet, rx_packet) = mpsc::channel();
         let (tx_ack, rx_ack) = mpsc::channel();
         let (rx_packet, rx_ack, loss_handle) = simulate_loss(rx_packet, rx_ack, loss);
         let mut sender = Sender::new(tx_packet, rx_ack, window_size);
         let mut reader = Reader::new(tx_ack, rx_packet);
-        let sender_handle = thread::spawn(move || {
-            sender.send(message.clone());
-            message
+        let message_received = thread::scope(|s| {
+            s.spawn(|| {
+                sender.send(message);
+            });
+            reader.read()
         });
-        let message_received = reader.read();
-        sender_handle.join().unwrap();
         drop(reader);
         loss_handle.join().unwrap();
         message_received
@@ -249,18 +253,18 @@ mod tests {
     #[test]
     fn test_gobackn_file() {
         let message_send = get_file_string();
-        let message_received = setup(3, message_send.clone());
+        let message_received = setup(3, &message_send);
         assert_eq!(message_send, message_received);
-        let message_received = setup(1, message_send.clone());
+        let message_received = setup(1, &message_send);
         assert_eq!(message_send, message_received);
     }
 
     #[test]
     fn test_gobackn_file_loss() {
         let message_send = get_file_string();
-        let message_received = setup_loss(3, message_send.clone(), 0.0);
+        let message_received = setup_loss(3, &message_send, 0.0);
         assert_eq!(message_send, message_received);
-        let message_received = setup_loss(3, message_send.clone(), 0.25);
+        let message_received = setup_loss(3, &message_send, 0.25);
         assert_eq!(message_send, message_received);
         // let message_received = setup_loss(3, message_send.clone(), 0.5);
         // assert_eq!(message_send, message_received);
@@ -269,10 +273,10 @@ mod tests {
     #[test]
     fn test_gobackn_small() {
         let message_send = String::from("test");
-        let message_received = setup(5, message_send.clone());
+        let message_received = setup(5, &message_send);
         assert_eq!(message_send, message_received);
         let message_send = String::from("");
-        let message_received = setup(5, message_send.clone());
+        let message_received = setup(5, &message_send);
         assert_eq!(message_send, message_received);
     }
 }
