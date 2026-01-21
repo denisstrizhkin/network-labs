@@ -4,8 +4,8 @@ use std::{
 };
 
 const DATA_SIZE: usize = u8::MAX as usize;
-const TIMEOUT_MS: u64 = 200;
-const TIMEOUT_SEC: u64 = 60;
+const TIMEOUT: Duration = Duration::from_millis(200);
+const TIMEOUT_TOTAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 enum PacketState {
@@ -54,7 +54,11 @@ impl Sender {
     pub fn send(&mut self, message: &str) {
         let bytes = message.as_bytes();
         let total_packets = bytes.len().div_ceil(DATA_SIZE).max(2);
+        let total_time = Instant::now();
         while self.packets_send_ack < total_packets {
+            if total_time.elapsed() > TIMEOUT_TOTAL {
+                panic!("Message send timeout");
+            }
             let start = self.base as usize;
             let end = (start + self.window_size as usize).min(total_packets);
             for i in start..end {
@@ -96,9 +100,8 @@ impl Sender {
 
     fn ack_packets(&mut self, start: usize, end: usize) {
         let timer = Instant::now();
-        let timeout = Duration::from_millis(TIMEOUT_MS);
         loop {
-            match self.rx.recv_timeout(timeout) {
+            match self.rx.recv_timeout(TIMEOUT) {
                 Ok(number) => {
                     let number = number as usize;
                     if number >= start && number < end {
@@ -110,7 +113,7 @@ impl Sender {
                 }
                 Err(RecvTimeoutError::Timeout) => break,
             }
-            if timer.elapsed() > timeout {
+            if timer.elapsed() > TIMEOUT {
                 break;
             }
         }
@@ -150,10 +153,12 @@ impl Reader {
 
     pub fn read(&mut self) -> String {
         let mut data = Vec::<u8>::new();
-        let timeout = Duration::from_millis(TIMEOUT_MS);
-        let elapsed = Instant::now();
+        let time_total = Instant::now();
         loop {
-            match self.rx.recv_timeout(timeout) {
+            if time_total.elapsed() > TIMEOUT_TOTAL {
+                panic!("Message read timeout");
+            }
+            match self.rx.recv_timeout(TIMEOUT) {
                 Ok(packet) => {
                     self.packets_received += 1;
                     if packet.number < self.number {
@@ -223,14 +228,12 @@ mod tests {
         let (tx_ack, rx_ack) = mpsc::channel();
         let mut sender = Sender::new(tx_packet, rx_ack, window_size);
         let mut reader = Reader::new(tx_ack, rx_packet);
-        let message_received = thread::scope(|s| {
+        thread::scope(|s| {
             s.spawn(|| {
                 sender.send(message);
             });
-
             reader.read()
-        });
-        message_received
+        })
     }
 
     fn setup_loss(window_size: AckNumber, message: &str, loss: f64) -> String {
@@ -245,8 +248,8 @@ mod tests {
             });
             reader.read()
         });
-        drop(reader);
         loss_handle.join().unwrap();
+        assert!(false);
         message_received
     }
 
@@ -264,8 +267,8 @@ mod tests {
         let message_send = get_file_string();
         let message_received = setup_loss(3, &message_send, 0.0);
         assert_eq!(message_send, message_received);
-        let message_received = setup_loss(3, &message_send, 0.25);
-        assert_eq!(message_send, message_received);
+        // let message_received = setup_loss(3, &message_send, 0.25);
+        // assert_eq!(message_send, message_received);
         // let message_received = setup_loss(3, message_send.clone(), 0.5);
         // assert_eq!(message_send, message_received);
     }

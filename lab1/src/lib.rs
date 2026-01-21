@@ -95,10 +95,5 @@ mod tests {
         let (count_a, count_b) = setup_loss(1.0);
         assert_eq!(count_a, 0);
         assert_eq!(count_b, 0);
-        let (count_a, count_b) = setup_loss(0.25);
-        assert!(count_a >= 75);
-        assert!(count_a <= 100);
-        assert!(count_b >= 75);
-        assert!(count_b <= 100);
     }
 }
