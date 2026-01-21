@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     sync::mpsc::{self, RecvTimeoutError},
     time::{Duration, Instant},
 };
@@ -16,7 +17,7 @@ enum PacketState {
 
 type AckNumber = u32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Packet {
     number: AckNumber,
     data: [u8; DATA_SIZE],
@@ -29,8 +30,10 @@ pub struct Sender {
     rx: mpsc::Receiver<u32>,
     window_size: AckNumber,
     base: AckNumber,
-    packets_send_total: usize,
-    packets_send_ack: usize,
+    packets_total: usize,
+    packets_send: usize,
+    packets_ack: usize,
+    packets_to_send: VecDeque<Packet>,
     packets_to_ack: Vec<bool>,
 }
 
@@ -45,25 +48,32 @@ impl Sender {
             rx,
             window_size,
             base: 0,
-            packets_send_total: 0,
-            packets_send_ack: 0,
+            packets_total: 0,
+            packets_send: 0,
+            packets_ack: 0,
+            packets_to_send: VecDeque::with_capacity(window_size as usize),
             packets_to_ack: vec![false; window_size as usize],
         }
     }
 
-    pub fn send(&mut self, message: &str) {
+    fn reset(&mut self, message: &str) {
+        self.base = 0;
+        self.packets_total = message.as_bytes().len().div_ceil(DATA_SIZE).max(2);
+        self.packets_send = 0;
+        self.packets_ack = 0;
+    }
+
+    fn prepare_packets(&mut self, message: &str) {
         let bytes = message.as_bytes();
-        let total_packets = bytes.len().div_ceil(DATA_SIZE).max(2);
-        let total_time = Instant::now();
-        while self.packets_send_ack < total_packets {
-            if total_time.elapsed() > TIMEOUT_TOTAL {
-                panic!("Message send timeout");
-            }
-            let start = self.base as usize;
-            let end = (start + self.window_size as usize).min(total_packets);
-            for i in start..end {
+        let start = self.base as usize;
+        let end = (start + self.window_size as usize).min(self.packets_total);
+        let unsend_packets = self.packets_to_send.len();
+        let packets = (start..end)
+            .enumerate()
+            .filter(|(i, _)| *i < unsend_packets)
+            .map(|(_, number)| {
+                let data_start = DATA_SIZE * number;
                 let mut data = [0; DATA_SIZE];
-                let data_start = DATA_SIZE * i;
                 let data_size = match bytes.len().checked_sub(data_start) {
                     Some(data_size) => {
                         let data_size = DATA_SIZE.min(data_size);
@@ -73,39 +83,60 @@ impl Sender {
                     }
                     None => 0,
                 };
-                let state = if i == 0 {
-                    println!("send beging");
+                let state = if number == 0 {
                     PacketState::Begin
-                } else if i + 1 == total_packets {
-                    println!("send end");
+                } else if number + 1 == self.packets_total {
                     PacketState::End
                 } else {
                     PacketState::Ongoing
                 };
-                let packet = Packet {
-                    number: i as AckNumber,
+                Packet {
+                    number: number as AckNumber,
                     data,
                     size: data_size as u8,
                     state,
-                };
-                if let Err(e) = self.tx.send(packet) {
-                    panic!("Failed to send packet {i}, base {}: {e}", self.base)
                 }
-                self.packets_to_ack[i - start] = false;
-                self.packets_send_total += 1;
+            });
+        self.packets_to_send.extend(packets);
+    }
+
+    pub fn send(&mut self, message: &str) {
+        self.reset(message);
+        let time = Instant::now();
+        while self.packets_ack < self.packets_total {
+            if time.elapsed() > TIMEOUT_TOTAL {
+                panic!("Message send timeout");
             }
-            self.ack_packets(start, end);
+            self.prepare_packets(message);
+            for (i, packet) in self.packets_to_send.iter().enumerate() {
+                if let Err(e) = self.tx.send(packet.clone()) {
+                    panic!(
+                        "Failed to send packet {}, base {}: {e}",
+                        packet.number, self.base
+                    )
+                }
+                self.packets_to_ack[i] = false;
+                self.packets_send += 1;
+            }
+            self.ack_packets();
         }
     }
 
-    fn ack_packets(&mut self, start: usize, end: usize) {
-        let timer = Instant::now();
+    fn ack_packets(&mut self) {
+        let mut time = Instant::now();
+        let start = self.base as usize;
+        let end = start + self.packets_to_send.len();
         loop {
             match self.rx.recv_timeout(TIMEOUT) {
                 Ok(number) => {
                     let number = number as usize;
                     if number >= start && number < end {
                         self.packets_to_ack[number - start] = true;
+                        while self.packets_to_ack[self.base as usize - start] {
+                            self.base += 1;
+                            self.packets_ack += 1;
+                            time = Instant::now();
+                        }
                     }
                 }
                 Err(e @ RecvTimeoutError::Disconnected) => {
@@ -113,22 +144,18 @@ impl Sender {
                 }
                 Err(RecvTimeoutError::Timeout) => break,
             }
-            if timer.elapsed() > TIMEOUT {
+            if time.elapsed() > TIMEOUT {
                 break;
             }
         }
-        for _ in self.packets_to_ack.iter().take_while(|&&is_ack| is_ack) {
-            self.base += 1;
-            self.packets_send_ack += 1;
-        }
     }
 
-    pub fn packets_send_total(&self) -> usize {
-        self.packets_send_total
+    pub fn packets_send(&self) -> usize {
+        self.packets_send
     }
 
-    pub fn packets_send_ack(&self) -> usize {
-        self.packets_send_ack
+    pub fn packets_ack(&self) -> usize {
+        self.packets_ack
     }
 }
 
