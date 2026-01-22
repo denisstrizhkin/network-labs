@@ -6,7 +6,7 @@ use std::{
 
 const DATA_SIZE: usize = u8::MAX as usize;
 const TIMEOUT: Duration = Duration::from_millis(200);
-const TIMEOUT_TOTAL: Duration = Duration::from_secs(10);
+const TIMEOUT_TOTAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 enum PacketState {
@@ -34,7 +34,6 @@ pub struct Sender {
     packets_send: usize,
     packets_ack: usize,
     packets_to_send: VecDeque<Packet>,
-    packets_to_ack: Vec<bool>,
     is_debug: bool,
 }
 
@@ -54,7 +53,6 @@ impl Sender {
             packets_send: 0,
             packets_ack: 0,
             packets_to_send: VecDeque::with_capacity(window_size as usize),
-            packets_to_ack: vec![false; window_size as usize],
             is_debug,
         }
     }
@@ -64,42 +62,43 @@ impl Sender {
         self.packets_total = message.as_bytes().len().div_ceil(DATA_SIZE).max(2);
         self.packets_send = 0;
         self.packets_ack = 0;
+        self.packets_to_send.clear();
+    }
+
+    fn window_end(&self) -> AckNumber {
+        (self.base + self.window_size).min(self.packets_total as u32)
     }
 
     fn prepare_packets(&mut self, message: &str) {
         let bytes = message.as_bytes();
         let start = self.base as usize;
-        let end = (start + self.window_size as usize).min(self.packets_total);
-        let unsend_packets = self.packets_to_send.len();
-        let packets = (start..end)
-            .enumerate()
-            .filter(|(i, _)| *i >= unsend_packets)
-            .map(|(_, number)| {
-                let data_start = DATA_SIZE * number;
-                let mut data = [0; DATA_SIZE];
-                let data_size = match bytes.len().checked_sub(data_start) {
-                    Some(data_size) => {
-                        let data_size = DATA_SIZE.min(data_size);
-                        data[..data_size]
-                            .copy_from_slice(&bytes[data_start..(data_start + data_size)]);
-                        data_size
-                    }
-                    None => 0,
-                };
-                let state = if number == 0 {
-                    PacketState::Begin
-                } else if number + 1 == self.packets_total {
-                    PacketState::End
-                } else {
-                    PacketState::Ongoing
-                };
-                Packet {
-                    number: number as AckNumber,
-                    data,
-                    size: data_size as u8,
-                    state,
+        let end = self.window_end() as usize;
+        let current_in_window = self.packets_to_send.len();
+        let packets = (start + current_in_window..end).map(|number| {
+            let data_start = DATA_SIZE * number;
+            let mut data = [0; DATA_SIZE];
+            let data_size = match bytes.len().checked_sub(data_start) {
+                Some(data_size) => {
+                    let data_size = DATA_SIZE.min(data_size);
+                    data[..data_size].copy_from_slice(&bytes[data_start..(data_start + data_size)]);
+                    data_size
                 }
-            });
+                None => 0,
+            };
+            let state = if number == 0 {
+                PacketState::Begin
+            } else if number + 1 == self.packets_total {
+                PacketState::End
+            } else {
+                PacketState::Ongoing
+            };
+            Packet {
+                number: number as AckNumber,
+                data,
+                size: data_size as u8,
+                state,
+            }
+        });
         self.packets_to_send.extend(packets);
     }
 
@@ -111,57 +110,53 @@ impl Sender {
                 panic!("Message send timeout");
             }
             self.prepare_packets(message);
-            for (i, packet) in self.packets_to_send.iter().enumerate() {
+            for packet in &self.packets_to_send {
                 if let Err(e) = self.tx.send(packet.clone()) {
                     panic!(
                         "Failed to send packet {}, base {}: {e}",
                         packet.number, self.base
                     )
                 }
-                self.packets_to_ack[i] = false;
                 self.packets_send += 1;
                 if self.is_debug {
                     println!(
-                        "Sender | Send packet: {}, size: {}, state: {:?}, window_size: {}, i: {i}",
+                        "Sender | Send packet: {}, size: {}, state: {:?}, window_size: {}",
                         packet.number, packet.size, packet.state, self.window_size
                     );
                 }
             }
-            self.ack_packets();
+            self.ack();
         }
     }
 
-    fn ack_packets(&mut self) {
+    fn ack(&mut self) {
+        let end = self.window_end();
         let mut time = Instant::now();
-        let start = self.base as usize;
-        let end = start + self.packets_to_send.len();
-        loop {
+        while !self.packets_to_send.is_empty() && time.elapsed() < TIMEOUT {
             match self.rx.recv_timeout(TIMEOUT) {
                 Ok(number) => {
-                    let number = number as usize;
-                    if !(number >= start && number < end) {
+                    if !(number >= self.base && number < end) {
                         continue;
                     }
-                    self.packets_to_ack[number - start] = true;
-                    for _ in (self.base as usize..end)
-                        .take_while(|&number| self.packets_to_ack[number - start])
-                    {
-                        self.base += 1;
-                        self.packets_ack += 1;
+                    for _ in self.base..=number {
                         self.packets_to_send.pop_front();
-                        time = Instant::now();
-                        if self.is_debug {
-                            println!("Sender | Ack packet: {}", number);
-                        }
+                        self.packets_ack += 1;
+                        self.base += 1;
                     }
+                    if self.is_debug {
+                        println!(
+                            "Sender | Ack up to packet: {}, {} out of {}",
+                            number, self.packets_ack, self.packets_total
+                        );
+                    }
+                    time = Instant::now();
                 }
-                Err(e @ RecvTimeoutError::Disconnected) => {
-                    panic!("Failed to receive ACK for packet: {e}");
+                Err(RecvTimeoutError::Timeout) => {
+                    break;
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-            }
-            if time.elapsed() > TIMEOUT {
-                break;
+                Err(RecvTimeoutError::Disconnected) => {
+                    panic!("Failed to receive ACK: disconnected");
+                }
             }
         }
     }
@@ -197,11 +192,19 @@ impl Reader {
     pub fn read(&mut self) -> String {
         let mut data = Vec::<u8>::new();
         let time_total = Instant::now();
+        let mut end_received = false;
         loop {
             if time_total.elapsed() > TIMEOUT_TOTAL {
                 panic!("Message read timeout");
             }
-            match self.rx.recv_timeout(TIMEOUT) {
+
+            let timeout = if end_received {
+                Duration::from_millis(500)
+            } else {
+                TIMEOUT
+            };
+
+            match self.rx.recv_timeout(timeout) {
                 Ok(packet) => {
                     self.packets_received += 1;
                     if packet.number < self.number {
@@ -209,6 +212,10 @@ impl Reader {
                         continue;
                     }
                     if packet.number > self.number {
+                        // In Go-Back-N, we can re-ACK the last correctly received packet
+                        if self.number > 0 {
+                            self.send_ack(self.number - 1);
+                        }
                         continue;
                     }
                     if self.packets_ack == 0 && !matches!(packet.state, PacketState::Begin) {
@@ -221,12 +228,20 @@ impl Reader {
                     self.packets_ack += 1;
                     self.number += 1;
                     if matches!(packet.state, PacketState::End) {
-                        break;
+                        end_received = true;
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(e @ RecvTimeoutError::Disconnected) => {
-                    panic!("Failed to receive packet: {e}");
+                Err(RecvTimeoutError::Timeout) => {
+                    if end_received {
+                        break;
+                    }
+                    continue;
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    if end_received {
+                        break;
+                    }
+                    panic!("Failed to receive packet: disconnected");
                 }
             }
         }
@@ -239,9 +254,7 @@ impl Reader {
     }
 
     fn send_ack(&mut self, ack: AckNumber) {
-        if let Err(e) = self.tx.send(ack) {
-            panic!("Failed to send ack {}: {e}", ack);
-        }
+        let _ = self.tx.send(ack);
     }
 }
 
@@ -283,16 +296,17 @@ mod tests {
         let (tx_packet, rx_packet) = mpsc::channel();
         let (tx_ack, rx_ack) = mpsc::channel();
         let (rx_packet, rx_ack, loss_handle) = simulate_loss(rx_packet, rx_ack, loss);
-        let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
-        let mut reader = Reader::new(tx_ack, rx_packet);
-        let message_received = thread::scope(|s| {
-            s.spawn(|| {
-                sender.send(message);
-            });
-            reader.read()
-        });
+        let message_received = {
+            let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
+            let mut reader = Reader::new(tx_ack, rx_packet);
+            thread::scope(|s| {
+                s.spawn(|| {
+                    sender.send(message);
+                });
+                reader.read()
+            })
+        };
         loss_handle.join().unwrap();
-        assert!(false);
         message_received
     }
 
@@ -312,10 +326,12 @@ mod tests {
         let message_send = get_file_string();
         let message_received = setup_loss(3, &message_send, 0.0);
         assert_eq!(message_send, message_received);
-        // let message_received = setup_loss(3, &message_send, 0.25);
-        // assert_eq!(message_send, message_received);
-        // let message_received = setup_loss(3, message_send.clone(), 0.5);
-        // assert_eq!(message_send, message_received);
+        let message_received = setup_loss(3, &message_send, 0.25);
+        assert_eq!(message_send, message_received);
+        let message_received = setup_loss(3, &message_send, 0.5);
+        assert_eq!(message_send, message_received);
+        let message_received = setup_loss(3, &message_send, 0.75);
+        assert_eq!(message_send, message_received);
     }
 
     #[test]
