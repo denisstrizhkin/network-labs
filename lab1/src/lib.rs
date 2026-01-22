@@ -7,6 +7,7 @@ use std::{
 
 pub mod gobackn;
 
+#[must_use] 
 pub fn simulate_loss<A: Send + 'static, B: Send + 'static>(
     ra: Receiver<A>,
     rb: Receiver<B>,

@@ -41,6 +41,7 @@ pub struct Sender {
 }
 
 impl Sender {
+    #[must_use] 
     pub fn new(
         tx: mpsc::Sender<Packet>,
         rx: mpsc::Receiver<AckNumber>,
@@ -172,6 +173,7 @@ impl Sender {
         Ok(())
     }
 
+    #[must_use] 
     pub fn efficiency_coefficient(&self) -> f64 {
         self.packets_total as f64 / self.packets_send as f64
     }
@@ -186,6 +188,7 @@ pub struct Reader {
 }
 
 impl Reader {
+    #[must_use] 
     pub fn new(tx: mpsc::Sender<AckNumber>, rx: mpsc::Receiver<Packet>, is_debug: bool) -> Self {
         Self {
             tx,
@@ -210,9 +213,8 @@ impl Reader {
             if time.elapsed() > TIMEOUT_TOTAL {
                 if is_finished_timeout.is_none() {
                     return Err("Message read timeout".to_string());
-                } else {
-                    break;
                 }
+                break;
             }
             match self.rx.try_recv() {
                 Ok(packet) => {
@@ -220,7 +222,7 @@ impl Reader {
                     if packet.number < self.number {
                         self.send_ack(packet.number)?;
                         if (packet.number + 1 == self.number) && is_finished_timeout.is_some() {
-                            is_finished_timeout = Some(Instant::now())
+                            is_finished_timeout = Some(Instant::now());
                         }
                         if self.is_debug {
                             eprintln!(
@@ -252,7 +254,7 @@ impl Reader {
                         );
                     }
                     if matches!(packet.state, PacketState::End) {
-                        is_finished_timeout = Some(Instant::now())
+                        is_finished_timeout = Some(Instant::now());
                     }
                 }
                 Err(TryRecvError::Empty) => {
@@ -271,16 +273,17 @@ impl Reader {
                 time.elapsed().as_millis()
             );
         }
-        String::from_utf8(data).map_err(|e| format!("Failed to encode the message: {}", e))
+        String::from_utf8(data).map_err(|e| format!("Failed to encode the message: {e}"))
     }
 
     fn send_ack(&mut self, ack: AckNumber) -> Result<(), String> {
         self.tx
             .send(ack)
-            .map_err(|e| format!("Failed to send ack {}: {e}", ack))
+            .map_err(|e| format!("Failed to send ack {ack}: {e}"))
     }
 }
 
+#[must_use] 
 pub fn setup(window_size: AckNumber, message: &str) -> (String, f64) {
     let (tx_packet, rx_packet) = mpsc::channel();
     let (tx_ack, rx_ack) = mpsc::channel();
@@ -290,13 +293,14 @@ pub fn setup(window_size: AckNumber, message: &str) -> (String, f64) {
         s.spawn(|| {
             if let Err(e) = sender.send(message) {
                 eprintln!("Sender | {e}");
-            };
+            }
         });
         reader.read()
     });
     (message_read.unwrap(), sender.efficiency_coefficient())
 }
 
+#[must_use] 
 pub fn setup_loss(window_size: AckNumber, message: &str, loss: f64) -> (String, f64) {
     let (tx_packet, rx_packet) = mpsc::channel();
     let (tx_ack, rx_ack) = mpsc::channel();
@@ -308,7 +312,7 @@ pub fn setup_loss(window_size: AckNumber, message: &str, loss: f64) -> (String, 
             s.spawn(|| {
                 if let Err(e) = sender.send(message) {
                     eprintln!("Sender | {e}");
-                };
+                }
             });
             reader.read()
         });
