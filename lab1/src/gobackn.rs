@@ -6,7 +6,7 @@ use std::{
 
 const DATA_SIZE: usize = u8::MAX as usize;
 const TIMEOUT: Duration = Duration::from_millis(200);
-const TIMEOUT_TOTAL: Duration = Duration::from_secs(60);
+const TIMEOUT_TOTAL: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 enum PacketState {
@@ -35,6 +35,7 @@ pub struct Sender {
     packets_ack: usize,
     packets_to_send: VecDeque<Packet>,
     packets_to_ack: Vec<bool>,
+    is_debug: bool,
 }
 
 impl Sender {
@@ -42,6 +43,7 @@ impl Sender {
         tx: mpsc::Sender<Packet>,
         rx: mpsc::Receiver<AckNumber>,
         window_size: AckNumber,
+        is_debug: bool,
     ) -> Self {
         Self {
             tx,
@@ -53,6 +55,7 @@ impl Sender {
             packets_ack: 0,
             packets_to_send: VecDeque::with_capacity(window_size as usize),
             packets_to_ack: vec![false; window_size as usize],
+            is_debug,
         }
     }
 
@@ -70,7 +73,7 @@ impl Sender {
         let unsend_packets = self.packets_to_send.len();
         let packets = (start..end)
             .enumerate()
-            .filter(|(i, _)| *i < unsend_packets)
+            .filter(|(i, _)| *i >= unsend_packets)
             .map(|(_, number)| {
                 let data_start = DATA_SIZE * number;
                 let mut data = [0; DATA_SIZE];
@@ -117,6 +120,12 @@ impl Sender {
                 }
                 self.packets_to_ack[i] = false;
                 self.packets_send += 1;
+                if self.is_debug {
+                    println!(
+                        "Sender | Send packet: {}, size: {}, state: {:?}, window_size: {}, i: {i}",
+                        packet.number, packet.size, packet.state, self.window_size
+                    );
+                }
             }
             self.ack_packets();
         }
@@ -130,12 +139,19 @@ impl Sender {
             match self.rx.recv_timeout(TIMEOUT) {
                 Ok(number) => {
                     let number = number as usize;
-                    if number >= start && number < end {
-                        self.packets_to_ack[number - start] = true;
-                        while self.packets_to_ack[self.base as usize - start] {
-                            self.base += 1;
-                            self.packets_ack += 1;
-                            time = Instant::now();
+                    if !(number >= start && number < end) {
+                        continue;
+                    }
+                    self.packets_to_ack[number - start] = true;
+                    for _ in (self.base as usize..end)
+                        .take_while(|&number| self.packets_to_ack[number - start])
+                    {
+                        self.base += 1;
+                        self.packets_ack += 1;
+                        self.packets_to_send.pop_front();
+                        time = Instant::now();
+                        if self.is_debug {
+                            println!("Sender | Ack packet: {}", number);
                         }
                     }
                 }
@@ -253,7 +269,7 @@ mod tests {
     fn setup(window_size: AckNumber, message: &str) -> String {
         let (tx_packet, rx_packet) = mpsc::channel();
         let (tx_ack, rx_ack) = mpsc::channel();
-        let mut sender = Sender::new(tx_packet, rx_ack, window_size);
+        let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
         let mut reader = Reader::new(tx_ack, rx_packet);
         thread::scope(|s| {
             s.spawn(|| {
@@ -267,7 +283,7 @@ mod tests {
         let (tx_packet, rx_packet) = mpsc::channel();
         let (tx_ack, rx_ack) = mpsc::channel();
         let (rx_packet, rx_ack, loss_handle) = simulate_loss(rx_packet, rx_ack, loss);
-        let mut sender = Sender::new(tx_packet, rx_ack, window_size);
+        let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
         let mut reader = Reader::new(tx_ack, rx_packet);
         let message_received = thread::scope(|s| {
             s.spawn(|| {
@@ -283,6 +299,8 @@ mod tests {
     #[test]
     fn test_gobackn_file() {
         let message_send = get_file_string();
+        let message_received = setup(5, &message_send);
+        assert_eq!(message_send, message_received);
         let message_received = setup(3, &message_send);
         assert_eq!(message_send, message_received);
         let message_received = setup(1, &message_send);
@@ -307,6 +325,12 @@ mod tests {
         assert_eq!(message_send, message_received);
         let message_send = String::from("");
         let message_received = setup(5, &message_send);
+        assert_eq!(message_send, message_received);
+        let message_send = String::from("test");
+        let message_received = setup(1, &message_send);
+        assert_eq!(message_send, message_received);
+        let message_send = String::from("");
+        let message_received = setup(1, &message_send);
         assert_eq!(message_send, message_received);
     }
 }
