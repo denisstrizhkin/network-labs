@@ -9,7 +9,7 @@ use crate::simulate_loss;
 
 const DATA_SIZE: usize = u8::MAX as usize;
 const TIMEOUT: Duration = Duration::from_millis(200);
-const TIMEOUT_TOTAL: Duration = Duration::from_secs(20);
+const TIMEOUT_TOTAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 enum PacketState {
@@ -164,7 +164,9 @@ impl Sender {
                         );
                     }
                 }
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(1));
+                }
                 Err(e @ TryRecvError::Disconnected) => {
                     return Err(format!("Failed to receive ACK: {e}"));
                 }
@@ -314,9 +316,12 @@ pub fn silent_setup_loss(window_size: AckNumber, message: &str, loss: f64) -> (S
                     eprintln!("Sender | {e}");
                 }
             });
-            reader.read()
+            reader.read().unwrap_or_else(|e| {
+                eprintln!("Reader warning: {e}");
+                String::new()
+            })
         });
-        (message_read.unwrap(), sender.efficiency_coefficient())
+        (message_read, sender.efficiency_coefficient())
     };
     loss_handle.join().unwrap();
     result

@@ -9,7 +9,7 @@ use crate::simulate_loss;
 
 const DATA_SIZE: usize = u8::MAX as usize;
 const TIMEOUT: Duration = Duration::from_millis(200);
-const TIMEOUT_TOTAL: Duration = Duration::from_secs(20);
+const TIMEOUT_TOTAL: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 enum PacketState {
@@ -186,6 +186,7 @@ impl Sender {
                     }
                 }
                 Err(TryRecvError::Empty) => {
+                    thread::sleep(Duration::from_millis(1));
                     if !self.window_packets.is_empty() && self.window_packets[0].is_acked {
                         // Slide window
                         self.window_packets.pop_front();
@@ -371,9 +372,12 @@ pub fn silent_setup_loss(window_size: AckNumber, message: &str, loss: f64) -> (S
                     eprintln!("Sender | {e}");
                 }
             });
-            reader.read()
+            reader.read().unwrap_or_else(|e| {
+                eprintln!("Reader warning: {e}");
+                String::new()
+            })
         });
-        (message_read.unwrap(), sender.efficiency_coefficient())
+        (message_read, sender.efficiency_coefficient())
     };
     loss_handle.join().unwrap();
     result

@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::Write;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let message = "A".repeat(1000); // 1000 bytes message
+    let message = "A".repeat(5_000); // 5_000 bytes message (~20 packets)
     let loss_rates = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
     // Window sizes 1 to 10
     let window_sizes: Vec<u32> = (1..=10).collect();
