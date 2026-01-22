@@ -6,6 +6,7 @@ use std::{
 };
 
 pub mod gobackn;
+pub mod selective_repeat;
 
 #[must_use] 
 pub fn simulate_loss<A: Send + 'static, B: Send + 'static>(
