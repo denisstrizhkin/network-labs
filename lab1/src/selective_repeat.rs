@@ -358,13 +358,13 @@ pub fn setup(window_size: AckNumber, message: &str) -> (String, f64) {
 }
 
 #[must_use] 
-pub fn setup_loss(window_size: AckNumber, message: &str, loss: f64) -> (String, f64) {
+pub fn silent_setup_loss(window_size: AckNumber, message: &str, loss: f64) -> (String, f64) {
     let (tx_packet, rx_packet) = mpsc::channel();
     let (tx_ack, rx_ack) = mpsc::channel();
     let (rx_packet, rx_ack, loss_handle) = simulate_loss(rx_packet, rx_ack, loss);
     let result = {
-        let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
-        let mut reader = Reader::new(tx_ack, rx_packet, window_size, true);
+        let mut sender = Sender::new(tx_packet, rx_ack, window_size, false);
+        let mut reader = Reader::new(tx_ack, rx_packet, window_size, false);
         let message_read = thread::scope(|s| {
             s.spawn(|| {
                 if let Err(e) = sender.send(message) {
