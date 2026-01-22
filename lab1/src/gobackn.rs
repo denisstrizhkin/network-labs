@@ -1,14 +1,17 @@
 use std::{
     collections::VecDeque,
-    sync::mpsc::{self, RecvTimeoutError},
+    sync::mpsc::{self, TryRecvError},
+    thread,
     time::{Duration, Instant},
 };
 
+use crate::simulate_loss;
+
 const DATA_SIZE: usize = u8::MAX as usize;
 const TIMEOUT: Duration = Duration::from_millis(200);
-const TIMEOUT_TOTAL: Duration = Duration::from_secs(120);
+const TIMEOUT_TOTAL: Duration = Duration::from_secs(20);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum PacketState {
     Begin,
     Ongoing,
@@ -102,38 +105,48 @@ impl Sender {
         self.packets_to_send.extend(packets);
     }
 
-    pub fn send(&mut self, message: &str) {
+    fn send_packet(&mut self, packet: Packet) -> Result<(), String> {
+        let number = packet.number;
+        let size = packet.size;
+        let state = packet.state;
+        if let Err(e) = self.tx.send(packet) {
+            return Err(format!(
+                "Failed to send packet {}, base {}: {e}",
+                number, self.base
+            ));
+        }
+        self.packets_send += 1;
+        if self.is_debug {
+            eprintln!(
+                "Sender | Send packet: {}, size: {}, state: {:?}, window_size: {}",
+                number, size, state, self.window_size
+            );
+        }
+        Ok(())
+    }
+
+    pub fn send(&mut self, message: &str) -> Result<(), String> {
         self.reset(message);
         let time = Instant::now();
         while self.packets_ack < self.packets_total {
             if time.elapsed() > TIMEOUT_TOTAL {
-                panic!("Message send timeout");
+                return Err(format!("Message send timeout"));
             }
             self.prepare_packets(message);
-            for packet in &self.packets_to_send {
-                if let Err(e) = self.tx.send(packet.clone()) {
-                    panic!(
-                        "Failed to send packet {}, base {}: {e}",
-                        packet.number, self.base
-                    )
-                }
-                self.packets_send += 1;
-                if self.is_debug {
-                    println!(
-                        "Sender | Send packet: {}, size: {}, state: {:?}, window_size: {}",
-                        packet.number, packet.size, packet.state, self.window_size
-                    );
-                }
+            let packets = self.packets_to_send.clone();
+            for packet in packets {
+                self.send_packet(packet)?;
             }
-            self.ack();
+            self.ack()?;
         }
+        Ok(())
     }
 
-    fn ack(&mut self) {
+    fn ack(&mut self) -> Result<(), String> {
         let end = self.window_end();
-        let mut time = Instant::now();
+        let time = Instant::now();
         while !self.packets_to_send.is_empty() && time.elapsed() < TIMEOUT {
-            match self.rx.recv_timeout(TIMEOUT) {
+            match self.rx.try_recv() {
                 Ok(number) => {
                     if !(number >= self.base && number < end) {
                         continue;
@@ -144,29 +157,23 @@ impl Sender {
                         self.base += 1;
                     }
                     if self.is_debug {
-                        println!(
+                        eprintln!(
                             "Sender | Ack up to packet: {}, {} out of {}",
                             number, self.packets_ack, self.packets_total
                         );
                     }
-                    time = Instant::now();
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    break;
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    panic!("Failed to receive ACK: disconnected");
+                Err(TryRecvError::Empty) => {}
+                Err(e @ TryRecvError::Disconnected) => {
+                    return Err(format!("Failed to receive ACK: {e}"));
                 }
             }
         }
+        Ok(())
     }
 
-    pub fn packets_send(&self) -> usize {
-        self.packets_send
-    }
-
-    pub fn packets_ack(&self) -> usize {
-        self.packets_ack
+    pub fn efficiency_coefficient(&self) -> f64 {
+        self.packets_total as f64 / self.packets_send as f64
     }
 }
 
@@ -175,7 +182,6 @@ pub struct Reader {
     rx: mpsc::Receiver<Packet>,
     number: AckNumber,
     packets_read: usize,
-    packets_ack: usize,
     is_debug: bool,
 }
 
@@ -186,7 +192,6 @@ impl Reader {
             rx,
             number: 0,
             packets_read: 0,
-            packets_ack: 0,
             is_debug,
         }
     }
@@ -194,161 +199,181 @@ impl Reader {
     fn reset(&mut self) {
         self.number = 0;
         self.packets_read = 0;
-        self.packets_ack = 0;
     }
 
-    pub fn read(&mut self) -> String {
+    pub fn read(&mut self) -> Result<String, String> {
         self.reset();
         let mut data = Vec::<u8>::new();
-        let mut is_finished = false;
+        let mut is_finished_timeout: Option<Instant> = None;
         let time = Instant::now();
         loop {
             if time.elapsed() > TIMEOUT_TOTAL {
-                panic!("Message read timeout");
+                if is_finished_timeout.is_none() {
+                    return Err(format!("Message read timeout"));
+                } else {
+                    break;
+                }
             }
-            match self.rx.recv_timeout(TIMEOUT) {
+            match self.rx.try_recv() {
                 Ok(packet) => {
                     self.packets_read += 1;
                     if packet.number < self.number {
-                        self.send_ack(packet.number);
+                        self.send_ack(packet.number)?;
+                        if (packet.number + 1 == self.number) && is_finished_timeout.is_some() {
+                            is_finished_timeout = Some(Instant::now())
+                        }
+                        if self.is_debug {
+                            eprintln!(
+                                "Reader | ReAck packet {}, state: {:?}, at: {}ms",
+                                packet.number,
+                                packet.state,
+                                time.elapsed().as_millis(),
+                            );
+                        }
                         continue;
                     }
                     if packet.number > self.number {
                         continue;
                     }
-                    if self.packets_ack == 0 && !matches!(packet.state, PacketState::Begin) {
-                        panic!("First packet does not correspond to the start of the message");
-                    } else if self.packets_ack != 0 && matches!(packet.state, PacketState::Begin) {
-                        panic!("Non first packet corresponds to the start of the message");
+                    if self.number == 0 && !matches!(packet.state, PacketState::Begin) {
+                        return Err(format!(
+                            "First packet does not correspond to the start of the message"
+                        ));
+                    } else if self.number != 0 && matches!(packet.state, PacketState::Begin) {
+                        return Err(format!(
+                            "Non first packet corresponds to the start of the message"
+                        ));
                     }
                     data.extend(&packet.data[..packet.size as usize]);
-                    self.send_ack(self.number);
-                    self.packets_ack += 1;
+                    self.send_ack(self.number)?;
                     self.number += 1;
                     if self.is_debug {
-                        println!(
-                            "Reader: Ack packet {}, state: {:?}",
-                            packet.number, packet.state
+                        eprintln!(
+                            "Reader | Ack packet {}, state: {:?}, at {}ms",
+                            packet.number,
+                            packet.state,
+                            time.elapsed().as_millis()
                         );
                     }
                     if matches!(packet.state, PacketState::End) {
-                        is_finished = true;
+                        is_finished_timeout = Some(Instant::now())
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => {
-                    if is_finished {
+                Err(TryRecvError::Empty) => {
+                    if is_finished_timeout.is_some_and(|t| t.elapsed() > 2 * TIMEOUT) {
                         break;
                     }
                 }
-                Err(e @ RecvTimeoutError::Disconnected) => {
-                    panic!("Failed to receive packet: {e}");
+                Err(e @ TryRecvError::Disconnected) => {
+                    return Err(format!("Failed to receive packet: {e}"));
                 }
             }
         }
-        match String::from_utf8(data) {
-            Ok(data) => data,
-            Err(e) => {
-                panic!("Failed to encode the message: {}", e);
-            }
+        if self.is_debug {
+            eprintln!(
+                "Reader | Finished receiving the message at {}ms",
+                time.elapsed().as_millis()
+            );
         }
+        String::from_utf8(data).map_err(|e| format!("Failed to encode the message: {}", e))
     }
 
-    fn send_ack(&mut self, ack: AckNumber) {
-        if let Err(e) = self.tx.send(ack) {
-            panic!("Failed to send ack {}: {e}", ack);
-        }
+    fn send_ack(&mut self, ack: AckNumber) -> Result<(), String> {
+        self.tx
+            .send(ack)
+            .map_err(|e| format!("Failed to send ack {}: {e}", ack))
     }
+}
+
+pub fn setup(window_size: AckNumber, message: &str) -> (String, f64) {
+    let (tx_packet, rx_packet) = mpsc::channel();
+    let (tx_ack, rx_ack) = mpsc::channel();
+    let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
+    let mut reader = Reader::new(tx_ack, rx_packet, true);
+    let message_read = thread::scope(|s| {
+        s.spawn(|| {
+            if let Err(e) = sender.send(message) {
+                eprintln!("Sender | {e}");
+            };
+        });
+        reader.read()
+    });
+    (message_read.unwrap(), sender.efficiency_coefficient())
+}
+
+pub fn setup_loss(window_size: AckNumber, message: &str, loss: f64) -> (String, f64) {
+    let (tx_packet, rx_packet) = mpsc::channel();
+    let (tx_ack, rx_ack) = mpsc::channel();
+    let (rx_packet, rx_ack, loss_handle) = simulate_loss(rx_packet, rx_ack, loss);
+    let result = {
+        let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
+        let mut reader = Reader::new(tx_ack, rx_packet, true);
+        let message_read = thread::scope(|s| {
+            s.spawn(|| {
+                if let Err(e) = sender.send(message) {
+                    eprintln!("Sender | {e}");
+                };
+            });
+            reader.read()
+        });
+        (message_read.unwrap(), sender.efficiency_coefficient())
+    };
+    loss_handle.join().unwrap();
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs::File,
-        io::Read,
-        thread::{self},
-    };
-
-    use crate::simulate_loss;
+    use std::{fs::File, io::Read};
 
     use super::*;
 
     fn get_file_string() -> String {
         let mut s = String::new();
-        File::open("src/gobackn.rs")
+        File::open("src/lib.rs")
             .unwrap()
             .read_to_string(&mut s)
             .unwrap();
         s
     }
 
-    fn setup(window_size: AckNumber, message: &str) -> String {
-        let (tx_packet, rx_packet) = mpsc::channel();
-        let (tx_ack, rx_ack) = mpsc::channel();
-        let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
-        let mut reader = Reader::new(tx_ack, rx_packet, true);
-        thread::scope(|s| {
-            s.spawn(|| {
-                sender.send(message);
-            });
-            reader.read()
-        })
-    }
-
-    fn setup_loss(window_size: AckNumber, message: &str, loss: f64) -> String {
-        let (tx_packet, rx_packet) = mpsc::channel();
-        let (tx_ack, rx_ack) = mpsc::channel();
-        let (rx_packet, rx_ack, loss_handle) = simulate_loss(rx_packet, rx_ack, loss);
-        let message_received = {
-            let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
-            let mut reader = Reader::new(tx_ack, rx_packet, true);
-            thread::scope(|s| {
-                s.spawn(|| {
-                    sender.send(message);
-                });
-                reader.read()
-            })
-        };
-        loss_handle.join().unwrap();
-        message_received
-    }
-
     #[test]
     fn test_gobackn_file() {
         let message_send = get_file_string();
-        let message_received = setup(5, &message_send);
+        let message_received = setup(5, &message_send).0;
         assert_eq!(message_send, message_received);
-        let message_received = setup(3, &message_send);
+        let message_received = setup(3, &message_send).0;
         assert_eq!(message_send, message_received);
-        let message_received = setup(1, &message_send);
+        let message_received = setup(1, &message_send).0;
         assert_eq!(message_send, message_received);
     }
 
     #[test]
     fn test_gobackn_file_loss() {
         let message_send = get_file_string();
-        let message_received = setup_loss(3, &message_send, 0.0);
+        let message_received = setup_loss(3, &message_send, 0.0).0;
         assert_eq!(message_send, message_received);
-        let message_received = setup_loss(3, &message_send, 0.25);
+        let message_received = setup_loss(3, &message_send, 0.25).0;
         assert_eq!(message_send, message_received);
-        let message_received = setup_loss(3, &message_send, 0.5);
+        let message_received = setup_loss(3, &message_send, 0.5).0;
         assert_eq!(message_send, message_received);
-        let message_received = setup_loss(3, &message_send, 0.75);
+        let message_received = setup_loss(3, &message_send, 0.75).0;
         assert_eq!(message_send, message_received);
     }
 
     #[test]
     fn test_gobackn_small() {
         let message_send = String::from("test");
-        let message_received = setup(5, &message_send);
+        let message_received = setup(5, &message_send).0;
         assert_eq!(message_send, message_received);
         let message_send = String::from("");
-        let message_received = setup(5, &message_send);
+        let message_received = setup(5, &message_send).0;
         assert_eq!(message_send, message_received);
         let message_send = String::from("test");
-        let message_received = setup(1, &message_send);
+        let message_received = setup(1, &message_send).0;
         assert_eq!(message_send, message_received);
         let message_send = String::from("");
-        let message_received = setup(1, &message_send);
+        let message_received = setup(1, &message_send).0;
         assert_eq!(message_send, message_received);
     }
 }
