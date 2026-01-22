@@ -62,7 +62,7 @@ impl Sender {
 
     fn reset(&mut self, message: &str) {
         self.base = 0;
-        self.packets_total = message.as_bytes().len().div_ceil(DATA_SIZE).max(2);
+        self.packets_total = message.len().div_ceil(DATA_SIZE).max(2);
         self.packets_send = 0;
         self.packets_ack = 0;
         self.packets_to_send.clear();
@@ -130,7 +130,7 @@ impl Sender {
         let time = Instant::now();
         while self.packets_ack < self.packets_total {
             if time.elapsed() > TIMEOUT_TOTAL {
-                return Err(format!("Message send timeout"));
+                return Err("Message send timeout".to_string());
             }
             self.prepare_packets(message);
             let packets = self.packets_to_send.clone();
@@ -209,7 +209,7 @@ impl Reader {
         loop {
             if time.elapsed() > TIMEOUT_TOTAL {
                 if is_finished_timeout.is_none() {
-                    return Err(format!("Message read timeout"));
+                    return Err("Message read timeout".to_string());
                 } else {
                     break;
                 }
@@ -236,13 +236,9 @@ impl Reader {
                         continue;
                     }
                     if self.number == 0 && !matches!(packet.state, PacketState::Begin) {
-                        return Err(format!(
-                            "First packet does not correspond to the start of the message"
-                        ));
+                        return Err("First packet does not correspond to the start of the message".to_string());
                     } else if self.number != 0 && matches!(packet.state, PacketState::Begin) {
-                        return Err(format!(
-                            "Non first packet corresponds to the start of the message"
-                        ));
+                        return Err("Non first packet corresponds to the start of the message".to_string());
                     }
                     data.extend(&packet.data[..packet.size as usize]);
                     self.send_ack(self.number)?;
