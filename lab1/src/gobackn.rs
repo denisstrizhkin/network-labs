@@ -6,7 +6,7 @@ use std::{
 
 const DATA_SIZE: usize = u8::MAX as usize;
 const TIMEOUT: Duration = Duration::from_millis(200);
-const TIMEOUT_TOTAL: Duration = Duration::from_secs(60);
+const TIMEOUT_TOTAL: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Clone)]
 enum PacketState {
@@ -174,48 +174,46 @@ pub struct Reader {
     tx: mpsc::Sender<AckNumber>,
     rx: mpsc::Receiver<Packet>,
     number: AckNumber,
-    packets_received: usize,
+    packets_read: usize,
     packets_ack: usize,
+    is_debug: bool,
 }
 
 impl Reader {
-    pub fn new(tx: mpsc::Sender<AckNumber>, rx: mpsc::Receiver<Packet>) -> Self {
+    pub fn new(tx: mpsc::Sender<AckNumber>, rx: mpsc::Receiver<Packet>, is_debug: bool) -> Self {
         Self {
             tx,
             rx,
             number: 0,
-            packets_received: 0,
+            packets_read: 0,
             packets_ack: 0,
+            is_debug,
         }
     }
 
+    fn reset(&mut self) {
+        self.number = 0;
+        self.packets_read = 0;
+        self.packets_ack = 0;
+    }
+
     pub fn read(&mut self) -> String {
+        self.reset();
         let mut data = Vec::<u8>::new();
-        let time_total = Instant::now();
-        let mut end_received = false;
+        let mut is_finished = false;
+        let time = Instant::now();
         loop {
-            if time_total.elapsed() > TIMEOUT_TOTAL {
+            if time.elapsed() > TIMEOUT_TOTAL {
                 panic!("Message read timeout");
             }
-
-            let timeout = if end_received {
-                Duration::from_millis(500)
-            } else {
-                TIMEOUT
-            };
-
-            match self.rx.recv_timeout(timeout) {
+            match self.rx.recv_timeout(TIMEOUT) {
                 Ok(packet) => {
-                    self.packets_received += 1;
+                    self.packets_read += 1;
                     if packet.number < self.number {
                         self.send_ack(packet.number);
                         continue;
                     }
                     if packet.number > self.number {
-                        // In Go-Back-N, we can re-ACK the last correctly received packet
-                        if self.number > 0 {
-                            self.send_ack(self.number - 1);
-                        }
                         continue;
                     }
                     if self.packets_ack == 0 && !matches!(packet.state, PacketState::Begin) {
@@ -227,21 +225,23 @@ impl Reader {
                     self.send_ack(self.number);
                     self.packets_ack += 1;
                     self.number += 1;
+                    if self.is_debug {
+                        println!(
+                            "Reader: Ack packet {}, state: {:?}",
+                            packet.number, packet.state
+                        );
+                    }
                     if matches!(packet.state, PacketState::End) {
-                        end_received = true;
+                        is_finished = true;
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    if end_received {
+                    if is_finished {
                         break;
                     }
-                    continue;
                 }
-                Err(RecvTimeoutError::Disconnected) => {
-                    if end_received {
-                        break;
-                    }
-                    panic!("Failed to receive packet: disconnected");
+                Err(e @ RecvTimeoutError::Disconnected) => {
+                    panic!("Failed to receive packet: {e}");
                 }
             }
         }
@@ -254,7 +254,9 @@ impl Reader {
     }
 
     fn send_ack(&mut self, ack: AckNumber) {
-        let _ = self.tx.send(ack);
+        if let Err(e) = self.tx.send(ack) {
+            panic!("Failed to send ack {}: {e}", ack);
+        }
     }
 }
 
@@ -283,7 +285,7 @@ mod tests {
         let (tx_packet, rx_packet) = mpsc::channel();
         let (tx_ack, rx_ack) = mpsc::channel();
         let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
-        let mut reader = Reader::new(tx_ack, rx_packet);
+        let mut reader = Reader::new(tx_ack, rx_packet, true);
         thread::scope(|s| {
             s.spawn(|| {
                 sender.send(message);
@@ -298,7 +300,7 @@ mod tests {
         let (rx_packet, rx_ack, loss_handle) = simulate_loss(rx_packet, rx_ack, loss);
         let message_received = {
             let mut sender = Sender::new(tx_packet, rx_ack, window_size, true);
-            let mut reader = Reader::new(tx_ack, rx_packet);
+            let mut reader = Reader::new(tx_ack, rx_packet, true);
             thread::scope(|s| {
                 s.spawn(|| {
                     sender.send(message);
